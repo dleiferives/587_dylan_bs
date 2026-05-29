@@ -17,9 +17,9 @@
 #include "extractor.hpp"
 
 // ─── Config ──────────────────────────────────────────────────────────────────
-static constexpr int   MAX_STEPS       = 10000; // safety cap only — real termination is lives() / game_over()
+static constexpr int   MAX_STEPS       = 2500;  // cap to prevent stallers — 2500*8 = 20000 game frames (~5.5 min)
 static constexpr int   NUM_GENERATIONS = 100000;
-static constexpr int   EVAL_TRIALS     = 1;    // single noisy sample; rely on large pop for selection signal
+static constexpr int   EVAL_TRIALS     = 3;    // 3 trials × varying seeds — less noise per genome
 static constexpr int   VAL_TRIALS      = 5;    // fixed held-out eval set for true progress measurement
 static constexpr int   VAL_TOP_K       = 5;    // re-evaluate top-K genomes on val set (robust progress signal)
 static const char*     CHECKPOINT_DIR  = "checkpoints_cpp";
@@ -35,7 +35,8 @@ struct AleCache {
 float evaluate(const neat::Genome& genome,
                ale::ALEInterface& ale,
                uint32_t seed,
-               AleCache& cache)
+               AleCache& cache,
+               int* out_steps = nullptr)
 {
     // Cached reset: if we already booted this seed on this ALE instance,
     // restore the post-boot state instead of re-running reset_game().
@@ -109,13 +110,18 @@ float evaluate(const neat::Genome& genome,
     //   + pellet_rate bonus:     pellets per step, scaled — rewards efficient clearing
     //   + tiny shaping:          early-learning gradient only
     //   NO survival bonus:       was the lazy-corner-hugger attractor
-    float pellet_rate = frames_survived > 0
-        ? (float)pellets_eaten / (float)frames_survived : 0.f;
+    if (out_steps) *out_steps = frames_survived;
+
+    // Saturating survival bonus: ramps up over the first ~500 steps, asymptotes near 100.
+    // Encourages staying alive long enough to actually play, but doesn't keep paying out
+    // for indefinite corner-hugging. Closed form: f(0)=0, f(200)≈63, f(500)≈92, f(1000)≈99.
+    float survival_bonus = 100.f * (1.f - std::exp(-(float)frames_survived / 200.f));
 
     return total_score
-         + ghosts_eaten * 100.f
-         + pellet_rate * 500.f
-         + shaping_total * 0.05f;
+         + ghosts_eaten * 100.f       // emphasize ghost-eating (high-skill behavior)
+         + pellets_eaten * 2.f        // small bonus per pellet (on top of ALE's 10)
+         + survival_bonus             // diminishing-return survival reward
+         + shaping_total * 0.05f;     // tiny early-learning gradient
 }
 
 // ─── Save genome to text file ─────────────────────────────────────────────────
@@ -145,7 +151,7 @@ int main(int argc, char* argv[]) {
     neat::Config cfg;
     cfg.n_inputs          = 32;
     cfg.n_outputs         = 5;
-    cfg.pop_size          = 300;
+    cfg.pop_size          = 600;
     cfg.compat_threshold  = 2.0f;   // larger species = more runway for structural mutations to survive
     cfg.add_conn_prob     = 0.25f;
     cfg.add_node_prob     = 0.10f;
@@ -200,6 +206,7 @@ int main(int argc, char* argv[]) {
             trial_seeds[t] = seed ^ ((uint32_t)gen * 997u + (uint32_t)t * 31337u);
 
         int n = (int)pop.genomes.size();
+        std::vector<int> train_steps(n, 0);
 
 #ifdef USE_OPENMP
         #pragma omp parallel for schedule(dynamic,1)
@@ -211,9 +218,14 @@ int main(int argc, char* argv[]) {
             int tid = 0;
 #endif
             float total = 0.f;
-            for (int t = 0; t < EVAL_TRIALS; t++)
-                total += evaluate(pop.genomes[i], *ale_pool[tid], trial_seeds[t], cache_pool[tid]);
+            int   step_total = 0;
+            for (int t = 0; t < EVAL_TRIALS; t++) {
+                int s = 0;
+                total += evaluate(pop.genomes[i], *ale_pool[tid], trial_seeds[t], cache_pool[tid], &s);
+                step_total += s;
+            }
             pop.genomes[i].fitness = total / EVAL_TRIALS;
+            train_steps[i] = step_total / EVAL_TRIALS;
         }
 
         // Pick top-K by training fitness as validation candidates.
@@ -225,6 +237,7 @@ int main(int argc, char* argv[]) {
 
         // Validate top-K on fixed held-out seeds (in parallel: K*VAL_TRIALS evals).
         std::vector<float> val_scores(k, 0.f);
+        std::vector<int>   val_steps(k, 0);
 #ifdef USE_OPENMP
         #pragma omp parallel for schedule(dynamic,1)
 #endif
@@ -235,9 +248,14 @@ int main(int argc, char* argv[]) {
             int tid = 0;
 #endif
             float total = 0.f;
-            for (int t = 0; t < VAL_TRIALS; t++)
-                total += evaluate(pop.genomes[idx[i]], *ale_pool[tid], val_seeds[t], cache_pool[tid]);
+            int   step_total = 0;
+            for (int t = 0; t < VAL_TRIALS; t++) {
+                int s = 0;
+                total += evaluate(pop.genomes[idx[i]], *ale_pool[tid], val_seeds[t], cache_pool[tid], &s);
+                step_total += s;
+            }
             val_scores[i] = total / VAL_TRIALS;
+            val_steps[i]  = step_total / VAL_TRIALS;
         }
 
         float val_max = *std::max_element(val_scores.begin(), val_scores.end());
@@ -264,6 +282,18 @@ int main(int argc, char* argv[]) {
         for (auto& g : pop.genomes) mean += g.fitness;
         mean /= pop.genomes.size();
 
+        float train_steps_mean = 0.f;
+        for (int s : train_steps) train_steps_mean += s;
+        train_steps_mean /= std::max(1, (int)train_steps.size());
+
+        float val_steps_mean = 0.f;
+        for (int s : val_steps) val_steps_mean += s;
+        val_steps_mean /= std::max(1, (int)val_steps.size());
+
+        int champ_val_pos = (int)(std::max_element(val_scores.begin(), val_scores.end())
+                              - val_scores.begin());
+        int best_steps = val_steps[champ_val_pos];
+
         std::cout << "Gen " << std::setw(3) << gen
                   << "  val_max=" << std::setw(7) << (int)val_max
                   << (new_best ? "*" : " ")
@@ -271,6 +301,10 @@ int main(int argc, char* argv[]) {
                   << "  best_ever=" << std::setw(7) << (int)best_val_ever
                   << "@" << std::setw(4) << best_val_gen
                   << "  train_mean=" << std::setw(6) << (int)mean
+                  << "  steps(train_mean/val_mean/best)="
+                  << (int)train_steps_mean << "/"
+                  << (int)val_steps_mean   << "/"
+                  << best_steps
                   << "  sp=" << pop.species.size()
                   << "  n=" << best.nodes.size()
                   << "  c=" << best.conns.size()
