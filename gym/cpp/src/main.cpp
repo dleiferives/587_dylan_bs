@@ -28,7 +28,7 @@ static thread_local std::mt19937 g_action_rng{std::random_device{}()};
 // train_mean is dominated by 300 dud genomes that die in 30 steps — useless as a signal.
 // val_mean reflects what the BEST agents can do, so the cap grows with real capability.
 static constexpr int   NUM_GENERATIONS = 100000;
-static constexpr int   EVAL_TRIALS     = 1;    // single noisy sample; rely on pop diversity + val filter
+static constexpr int   EVAL_TRIALS     = 3;    // 3 trials; selection uses MEDIAN (robust to one bad seed)
 static constexpr int   VAL_TRIALS      = 5;    // fixed held-out eval set for true progress measurement
 static constexpr int   VAL_TOP_K       = 5;    // re-evaluate top-K genomes on val set (robust progress signal)
 static const char*     CHECKPOINT_DIR  = "checkpoints_cpp";
@@ -124,14 +124,26 @@ float evaluate(const neat::Genome& genome,
             if (visited_tiles.insert(key).second) novelty_bonus += 1.f;
         }
 
-        // Add small uniform noise to outputs before argmax. This is "noisy argmax" /
-        // soft epsilon-greedy: a network with near-tied outputs would otherwise pick
-        // action 0 (NOOP) every step and just stand there. Noise breaks the tie randomly
-        // so the agent actually explores moves and gets a chance at pellets.
-        std::uniform_real_distribution<float> noise(-0.15f, 0.15f);
-        for (auto& o : output) o += noise(g_action_rng);
-
-        int best = (int)(std::max_element(output.begin(), output.end()) - output.begin());
+        // Softmax(τ) action selection. Per Sutton & Barto §2.3 and the noisy-EA
+        // literature, softmax beats epsilon-greedy when the worst actions are very bad
+        // (= running into a ghost). With τ=0.5 the best action is favored but lesser
+        // actions still get tried with probability proportional to exp(o/τ).
+        constexpr float TEMPERATURE = 0.5f;
+        float max_out = *std::max_element(output.begin(), output.end());
+        std::vector<float> probs(output.size());
+        float psum = 0.f;
+        for (size_t i = 0; i < output.size(); i++) {
+            probs[i] = std::exp((output[i] - max_out) / TEMPERATURE);
+            psum += probs[i];
+        }
+        std::uniform_real_distribution<float> u01(0.f, 1.f);
+        float r = u01(g_action_rng) * psum;
+        int best = 0;
+        float cum = 0.f;
+        for (size_t i = 0; i < probs.size(); i++) {
+            cum += probs[i];
+            if (r <= cum) { best = (int)i; break; }
+        }
         ale::Action action = actions[std::min(best, (int)actions.size()-1)];
 
         float reward = ale.act(action);
@@ -403,6 +415,17 @@ int main(int argc, char* argv[]) {
     int   best_val_gen  = -1;
     int   adaptive_max_steps = 500;  // baseline for gen 0; updated from val_mean each gen
 
+    // ─── Hall of Fame: preserve top-K genomes EVER, regardless of species stagnation ─
+    // Counters the "lucky breakthrough lost" problem: a genome that scored well once
+    // is kept and re-evaluated every gen with fresh seeds. Genes spread via crossover.
+    constexpr int HOF_SIZE = 8;
+    struct HofEntry {
+        neat::Genome genome;
+        float val_score = -1e9f;   // last re-evaluated val score
+        int   first_gen = -1;       // when entered the hall
+    };
+    std::vector<HofEntry> hall_of_fame;
+
     for (int gen = 0; gen < NUM_GENERATIONS; gen++) {
         auto t0 = std::chrono::steady_clock::now();
 
@@ -423,15 +446,20 @@ int main(int argc, char* argv[]) {
 #else
             int tid = 0;
 #endif
-            float total = 0.f;
-            int   step_total = 0;
+            // Run each trial, collect per-trial fitness. Selection uses MEDIAN
+            // not MEAN — robust to single lucky/unlucky seed dragging the average.
+            std::array<float, EVAL_TRIALS> trial_fit{};
+            int step_total = 0;
             for (int t = 0; t < EVAL_TRIALS; t++) {
                 int s = 0;
-                total += evaluate(pop.genomes[i], *ale_pool[tid], trial_seeds[t], cache_pool[tid],
-                                  adaptive_max_steps, &s);
+                trial_fit[t] = evaluate(pop.genomes[i], *ale_pool[tid], trial_seeds[t],
+                                        cache_pool[tid], adaptive_max_steps, &s);
                 step_total += s;
             }
-            pop.genomes[i].fitness = total / EVAL_TRIALS;
+            // Median of EVAL_TRIALS=3 → sort and take middle element
+            std::array<float, EVAL_TRIALS> sorted = trial_fit;
+            std::sort(sorted.begin(), sorted.end());
+            pop.genomes[i].fitness = sorted[EVAL_TRIALS / 2];
             train_steps[i] = step_total / EVAL_TRIALS;
         }
 
@@ -482,6 +510,40 @@ int main(int argc, char* argv[]) {
             new_best = true;
         }
 
+        // ── Hall of Fame update ──
+        // Re-evaluate existing HOF members on the SAME val seeds we just used,
+        // so their scores reflect current selection pressure (not stale memories).
+        for (auto& h : hall_of_fame) {
+            float total = 0.f;
+            for (int t = 0; t < VAL_TRIALS; t++)
+                total += evaluate(h.genome, *ale_pool[0], val_seeds[t], cache_pool[0],
+                                  adaptive_max_steps);
+            h.val_score = total / VAL_TRIALS;
+        }
+        // Consider adding the top-K val genomes from this gen.
+        for (int i = 0; i < k; i++) {
+            float s = val_scores[i];
+            if ((int)hall_of_fame.size() < HOF_SIZE) {
+                HofEntry e;
+                e.genome = pop.genomes[idx[i]];
+                e.val_score = s;
+                e.first_gen = gen;
+                hall_of_fame.push_back(std::move(e));
+            } else {
+                // Find worst entry; replace if this candidate beats it
+                auto worst = std::min_element(hall_of_fame.begin(), hall_of_fame.end(),
+                    [](const HofEntry& a, const HofEntry& b){ return a.val_score < b.val_score; });
+                if (s > worst->val_score) {
+                    worst->genome = pop.genomes[idx[i]];
+                    worst->val_score = s;
+                    worst->first_gen = gen;
+                }
+            }
+        }
+        // Sort HOF best-first for display
+        std::sort(hall_of_fame.begin(), hall_of_fame.end(),
+            [](const HofEntry& a, const HofEntry& b){ return a.val_score > b.val_score; });
+
         auto t1 = std::chrono::steady_clock::now();
         double elapsed = std::chrono::duration<double>(t1-t0).count();
 
@@ -519,6 +581,9 @@ int main(int argc, char* argv[]) {
                   << (int)val_steps_mean   << "/"
                   << best_steps
                   << "  cap=" << adaptive_max_steps
+                  << "  hof=" << (hall_of_fame.empty() ? 0 : (int)hall_of_fame.front().val_score)
+                  << "/" << (hall_of_fame.empty() ? 0 : (int)hall_of_fame.back().val_score)
+                  << "(" << hall_of_fame.size() << ")"
                   << "  sp=" << pop.species.size()
                   << "  n=" << best.nodes.size()
                   << "  c=" << best.conns.size()
@@ -555,6 +620,24 @@ int main(int argc, char* argv[]) {
         }
 
         pop.evolve();
+
+        // ── Hall of Fame injection ──
+        // After evolve() builds the new population, splice HOF genomes in to replace
+        // the bottom-K by training fitness. They get re-evaluated next gen and their
+        // genes propagate via species assignment + crossover.
+        if (!hall_of_fame.empty()) {
+            // Sort current new population by fitness ascending — worst at front.
+            // (Note: fitness is 0 after evolve resets it, so we use insertion order as proxy.)
+            // Simply overwrite the LAST K genomes with HOF copies. evolve() places elites
+            // first, so the tail tends to be filler/mutated entries — safe to replace.
+            int inject = std::min((int)hall_of_fame.size(), (int)pop.genomes.size());
+            for (int i = 0; i < inject; i++) {
+                auto& slot = pop.genomes[pop.genomes.size() - 1 - i];
+                slot = hall_of_fame[i].genome;
+                slot.id = pop.next_genome_id++;
+                slot.fitness = 0.f;
+            }
+        }
     }
 
     std::cout << "\nDone. Best genomes saved to " << CHECKPOINT_DIR << "/\n";
