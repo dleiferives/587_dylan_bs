@@ -25,13 +25,20 @@ static constexpr uint8_t PAL_SCARED = 214;
 
 static constexpr int PP_MAX_WIDTH = 5;
 
-// RAM address layout (verified by pixel correlation, R²=1.000)
-//   X positions (raw pixel): 0x30=G0, 0x31=Pac, 0x32=G1, 0x33=G2, 0x34=G3
-//   Y positions (maze_y = 2*ram + 15): 0x36=Pac, 0x37=G0, 0x38=G1, 0x39=G2, 0x3A=G3
-static constexpr uint8_t RAM_PAC_X    = 0x31;
-static constexpr uint8_t RAM_PAC_Y    = 0x36;
-static constexpr uint8_t RAM_GHOST_X[4] = {0x30, 0x32, 0x33, 0x34};
+// RAM address layout from datacrystal.tcrf.net Pac-Man Atari 2600 RAM map
+//   0x08-0x17 (16 bytes) = dot bitmap     ← used for accurate dot count
+//   0x18 = lives
+//   0x31 = Pac-Man X       0x36 = Pac-Man Y
+//   0x32-0x35 = Ghost X    0x37-0x3A = Ghost Y
+//   0x4C-0x51 = score
+//   0x68 = sound slot (0x01=ghost, 0x02/0x04=power, 0x08=dot)
+static constexpr uint8_t RAM_PAC_X      = 0x31;
+static constexpr uint8_t RAM_PAC_Y      = 0x36;
+static constexpr uint8_t RAM_GHOST_X[4] = {0x32, 0x33, 0x34, 0x35};   // BUGFIX: was {0x30,0x32,0x33,0x34}
 static constexpr uint8_t RAM_GHOST_Y[4] = {0x37, 0x38, 0x39, 0x3A};
+static constexpr uint8_t RAM_DOTS_BASE  = 0x08;
+static constexpr uint8_t RAM_DOTS_END   = 0x17;   // inclusive (16 bytes total)
+static constexpr uint8_t RAM_SOUND_SLOT = 0x68;
 
 // ─── Screen helper ────────────────────────────────────────────────────────────
 inline uint8_t screen_px(const ale::ALEScreen& s, int r, int c) {
@@ -144,17 +151,19 @@ public:
                 return da < db;
             });
 
-        // ── Pellets: check only known positions ──────────────────────────────
-        std::fill(pel_mask_.begin(), pel_mask_.end(), false);
-        int current_pellets = 0;
+        // ── Pellets: positions still from screen (geometric input) but COUNT from RAM ──
+        // Screen scan tells us which specific positions still have a dot (used for
+        // closest-pellet vector). Brief Pacman occlusion causes flicker but that's OK
+        // for direction-finding. The TRUE remaining-count comes from the RAM bitmap.
+        for (int idx : pellet_coords_) pel_mask_[idx] = false;   // clear only known positions
         for (int idx : pellet_coords_) {
             int r = idx / MAZE_W, c = idx % MAZE_W;
-            if (screen_px(screen, r+MAZE_R0, c) == PAL_PELLET) {
+            if (screen_px(screen, r+MAZE_R0, c) == PAL_PELLET)
                 pel_mask_[idx] = true;
-                current_pellets++;
-            }
         }
-        state.pellet_fraction = (float)current_pellets / initial_pellet_count_;
+        if (ram_dot_initial_ < 0) ram_dot_initial_ = std::max(1, dot_count_from_ram(ram));
+        int current_dots_ram = dot_count_from_ram(ram);
+        state.pellet_fraction = (float)current_dots_ram / (float)ram_dot_initial_;
 
         // ── Power pellets: check only known positions ────────────────────────
         state.power_pellets.clear();
@@ -171,6 +180,20 @@ public:
     const std::vector<bool>& pel_mask()      const { return pel_mask_; }
     const std::vector<int>&  pellet_coords() const { return pellet_coords_; }
 
+    // RAM-based dot count: popcount of the 16-byte dot bitmap. Clean, no screen artifacts.
+    // Initial value (full level) is the bit count of all dots present.
+    static int dot_count_from_ram(const ale::ALERAM& ram) {
+        int n = 0;
+        for (int i = RAM_DOTS_BASE; i <= RAM_DOTS_END; i++)
+            n += __builtin_popcount(ram.get(i));
+        return n;
+    }
+
+    // Sound slot tells us what was just eaten this frame.
+    static uint8_t sound_event(const ale::ALERAM& ram) {
+        return ram.get(RAM_SOUND_SLOT);
+    }
+
     // Precomputed wall distances lookup: [cell_idx][dir] where dir=0up,1down,2left,3right
     const std::array<float,4>& wall_dist(int r, int c) const {
         return wall_dist_table_[r*MAZE_W+c];
@@ -186,6 +209,7 @@ private:
     std::array<float,4> prev_ghost_r_{}, prev_ghost_c_{};
     bool prev_valid_ = false;
     int  scared_remaining_ = 0;
+    int  ram_dot_initial_  = -1;   // popcount of dot bitmap on first extract()
 
     void precompute_wall_distances() {
         for (int r = 0; r < MAZE_H; r++) {
