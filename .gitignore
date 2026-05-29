@@ -2,3 +2,4 @@
 /gym/cpp/ALE
 /gym/cpp/build
 /gym/cpp/checkpoints_cpp
+/gym/cpp/perf.data
