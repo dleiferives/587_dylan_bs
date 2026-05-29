@@ -28,7 +28,7 @@ static thread_local std::mt19937 g_action_rng{std::random_device{}()};
 // train_mean is dominated by 300 dud genomes that die in 30 steps — useless as a signal.
 // val_mean reflects what the BEST agents can do, so the cap grows with real capability.
 static constexpr int   NUM_GENERATIONS = 100000;
-static constexpr int   EVAL_TRIALS     = 3;    // 3 trials; selection uses MEDIAN (robust to one bad seed)
+static constexpr int   EVAL_TRIALS     = 5;    // 5 trials; selection uses MEDIAN (robust to outliers)
 static constexpr int   VAL_TRIALS      = 5;    // fixed held-out eval set for true progress measurement
 static constexpr int   VAL_TOP_K       = 5;    // re-evaluate top-K genomes on val set (robust progress signal)
 static const char*     CHECKPOINT_DIR  = "checkpoints_cpp";
@@ -368,7 +368,7 @@ int main(int argc, char* argv[]) {
     neat::Config cfg;
     cfg.n_inputs          = 32;
     cfg.n_outputs         = 5;
-    cfg.pop_size          = 300;
+    cfg.pop_size          = 1000;
     cfg.compat_threshold  = 2.0f;   // larger species = more runway for structural mutations to survive
     cfg.add_conn_prob     = 0.25f;
     cfg.add_node_prob     = 0.10f;
