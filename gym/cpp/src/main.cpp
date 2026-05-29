@@ -59,7 +59,11 @@ float evaluate(const neat::Genome& genome,
 
     float total_score     = 0.f;
     int   frames_survived = 0;
-    float prev_pellet_dist = -1.f;  // for dense shaping
+    int   pellets_eaten   = 0;
+    int   ghosts_eaten    = 0;
+    float prev_pellet_frac = -1.f;
+    float prev_pellet_dist = -1.f;
+    float shaping_total    = 0.f;
 
     for (int step = 0; step < MAX_STEPS && !ale.game_over(); step++) {
         // Terminate on FIRST death — don't waste cycles on Pac-Man's 2 backup lives.
@@ -69,6 +73,15 @@ float evaluate(const neat::Genome& genome,
         auto inputs = build_inputs(state, extractor);
         auto output = net.activate(inputs);
 
+        // Track pellets eaten via fraction-drop from extractor.
+        if (prev_pellet_frac < 0.f) prev_pellet_frac = state.pellet_fraction;
+        if (state.pellet_fraction < prev_pellet_frac) {
+            float ate = (prev_pellet_frac - state.pellet_fraction)
+                      * (float)extractor.pellet_coords().size();
+            pellets_eaten += (int)std::round(ate);
+            prev_pellet_frac = state.pellet_fraction;
+        }
+
         // argmax → action
         int best = (int)(std::max_element(output.begin(), output.end()) - output.begin());
         ale::Action action = actions[std::min(best, (int)actions.size()-1)];
@@ -77,17 +90,32 @@ float evaluate(const neat::Genome& genome,
         total_score += reward;
         frames_survived++;
 
-        // Dense shaping: small reward for moving closer to nearest pellet.
-        // inputs[29-30] = (delta_r/MAZE_H, delta_c/MAZE_W) to closest pellet.
+        // Ghost-eating detection: scared-ghost rewards are 200/400/800/1600.
+        if (reward >= 200.f) ghosts_eaten++;
+
+        // Tiny dense shaping — just enough gradient for blind early agents,
+        // not enough to farm by orbiting pellets without eating.
         float pdr = inputs[29] * MAZE_H;
         float pdc = inputs[30] * MAZE_W;
         float pellet_dist = std::hypot(pdr, pdc);
         if (prev_pellet_dist > 0.f && pellet_dist < prev_pellet_dist)
-            total_score += 0.5f * (prev_pellet_dist - pellet_dist);
+            shaping_total += (prev_pellet_dist - pellet_dist);
         prev_pellet_dist = pellet_dist;
     }
 
-    return total_score + frames_survived * 0.04f;  // *4 to match pre-frameskip scale
+    // Fitness composition:
+    //   ALE total_score:         10/pellet, 50/power, 200..1600/ghost, level bonus
+    //   + ghosts_eaten * 100:    extra emphasis — ghost-eating is the high-skill behavior
+    //   + pellet_rate bonus:     pellets per step, scaled — rewards efficient clearing
+    //   + tiny shaping:          early-learning gradient only
+    //   NO survival bonus:       was the lazy-corner-hugger attractor
+    float pellet_rate = frames_survived > 0
+        ? (float)pellets_eaten / (float)frames_survived : 0.f;
+
+    return total_score
+         + ghosts_eaten * 100.f
+         + pellet_rate * 500.f
+         + shaping_total * 0.05f;
 }
 
 // ─── Save genome to text file ─────────────────────────────────────────────────
